@@ -1,0 +1,15 @@
+services:
+  ipv4-shadow-analyzer:
+    build: .
+    image: ipv4-shadow-analyzer:latest
+    container_name: ipv4-shadow-analyzer
+    ports:
+      # 宿主机端口:容器端口；宿主机端口可用 HTTP_PORT 覆盖
+      - "${HTTP_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
