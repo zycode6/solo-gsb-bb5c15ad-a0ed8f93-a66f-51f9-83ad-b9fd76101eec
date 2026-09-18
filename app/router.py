@@ -12,6 +12,11 @@
 一次，再移除失败下一跳对应的**全部路由**并重新执行完整的选择流程
 （允许回退到更高 metric 或更短前缀），逐目标给出 before/after/impact。
 
+:func:`audit_routes` 做全表审计：按“最长前缀优先、同前缀最低 metric、
+同 metric 并行路由（ECMP）共享”的语义，计算每条路由在整个 IPv4 空间
+**实际负责**的地址集合，给出 active/partial/shadowed 状态、生效地址数
+与无损压缩后的最少 CIDR。
+
 全程只做 32 位整数比较，**不逐地址展开网段**，可安全处理 ``0.0.0.0/0``。
 """
 from __future__ import annotations
@@ -20,7 +25,15 @@ from collections import defaultdict
 from ipaddress import IPv4Address, ip_address
 from typing import Sequence
 
-from .analyzer import parse_cidr_v4
+from .analyzer import (
+    PARTIAL,
+    SHADOWED,
+    V4_SPACE,
+    compress_intervals,
+    merge_intervals,
+    parse_cidr_v4,
+    subtract_covered,
+)
 
 #: 单次请求允许的最大路由条数
 ROUTES_MAX = 1000
@@ -38,6 +51,16 @@ METRIC_MAX = 65535
 
 REACHABLE = "reachable"
 UNREACHABLE = "unreachable"
+
+#: 审计状态：active 全生效（复用 analyzer 的 PARTIAL / SHADOWED 取值）
+ACTIVE = "active"
+
+#: 审计状态中文说明
+AUDIT_STATUS_LABELS = {
+    ACTIVE: "生效",
+    PARTIAL: "部分生效",
+    SHADOWED: "完全遮蔽",
+}
 
 #: 故障切换影响分类
 UNCHANGED = "unchanged"
@@ -393,4 +416,138 @@ def failover_routes(
         "failed_next_hops": [text for _value, text in parsed_failed],
         "results": results,
         "summary": impact_counts,
+    }
+
+
+# ---------- 全表审计（/routes/audit） ----------
+
+
+def _group_effective_intervals(
+    parsed_routes: Sequence[dict],
+    groups: dict[tuple[int, int], list[int]],
+) -> dict[tuple[int, int], list[tuple[int, int]]]:
+    """计算每个网段（去重后）在 LPM 语义下留给本前缀的地址碎片。
+
+    对网段 N，任何**前缀更长**的路由网段都会在 N 的范围内优先胜出
+    （与 metric 无关），因此 N 留给本前缀的集合 = N 减去所有被 N 包含的
+    更长前缀网段的并集。返回 ``{(start, end): 有序不相交碎片列表}``。
+    """
+    # 去重后的网段区间（合并遮蔽并集时与路由重复无关）
+    distinct = sorted({(r["start"], r["end"]) for r in parsed_routes})
+    effective: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for key in groups:
+        start, end = key
+        # 被本网段严格包含的区间即“前缀更长”的网段（同网段已去重，不会相等）
+        longer = [
+            (s, e)
+            for s, e in distinct
+            if s >= start and e <= end and (s, e) != key
+        ]
+        effective[key] = subtract_covered(key, merge_intervals(longer))
+    return effective
+
+
+def audit_routes(
+    routes: Sequence[tuple[str, str, int]],
+) -> dict:
+    """审计有序静态路由表：每条路由在整个 IPv4 空间实际负责的地址集合。
+
+    语义与 :func:`resolve_routes` 的选择规则一致：
+
+    1. **最长前缀优先**：地址 x 若被更长前缀的路由网段覆盖，则短前缀路由
+       在 x 上永远不生效（与 metric 无关）；
+    2. **同前缀最低 metric**：规范化网段相同的路由中，仅最低 metric 者生效，
+       更高 metric 的路由整体被遮蔽（生效集合为空）；
+    3. **ECMP 共享**：同网段、同（最低）metric 的并行路由**共享**同一生效
+       集合，各自完整报告（不做拆分），``ecmp_group`` 按输入顺序列出同
+       网段同 metric 的全部路由序号（含自身）。
+
+    ``routes`` 每项为 ``(cidr, next_hop, metric)``，允许为空（此时
+    ``routes`` 结果为空、整个 IPv4 空间均未覆盖）。返回可直接 JSON 序列化
+    的字典：``routes`` 保持输入顺序，每项含 ``index`` / ``cidr`` /
+    ``next_hop`` / ``metric`` / ``status``（``active`` / ``partial`` /
+    ``shadowed``）/ ``status_label`` / ``total_addresses`` /
+    ``effective_addresses`` / ``effective_cidrs``（无损、数量最少）/
+    ``ecmp_group``；``summary`` 汇总三种状态的路由数，以及全表在整个
+    IPv4 空间实际覆盖 / 未覆盖的地址数（ECMP 共享集合只计一次）。
+    非法 CIDR / 地址 / metric 抛出对应 ValueError 子类。
+    """
+    parsed_routes, _hop_first_index = _parse_route_entries(routes)
+
+    # 按规范化网段分组（组内保持输入顺序）
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, route in enumerate(parsed_routes):
+        groups.setdefault((route["start"], route["end"]), []).append(index)
+
+    # 每个网段的最低 metric：高于它的路由整体被遮蔽
+    min_metric = {
+        key: min(parsed_routes[i]["metric"] for i in indexes)
+        for key, indexes in groups.items()
+    }
+    # 每个网段留给本前缀的地址碎片（LPM 语义，组内共享）
+    group_remaining = _group_effective_intervals(parsed_routes, groups)
+
+    # 同网段同 metric 的并行路由组（共享生效集合），按输入顺序
+    ecmp_group_of: dict[int, list[int]] = {}
+    for indexes in groups.values():
+        by_metric: dict[int, list[int]] = defaultdict(list)
+        for index in indexes:
+            by_metric[parsed_routes[index]["metric"]].append(index)
+        for peers in by_metric.values():
+            for index in peers:
+                ecmp_group_of[index] = peers
+
+    result_routes: list[dict] = []
+    status_counts = {ACTIVE: 0, PARTIAL: 0, SHADOWED: 0}
+
+    for index, route in enumerate(parsed_routes):
+        key = (route["start"], route["end"])
+        total_addresses = route["end"] - route["start"] + 1
+        if route["metric"] == min_metric[key]:
+            remaining = group_remaining[key]
+        else:
+            # 同前缀存在更低 metric：本路由整体被遮蔽
+            remaining = []
+        effective_addresses = sum(e - s + 1 for s, e in remaining)
+
+        if effective_addresses == 0:
+            status = SHADOWED
+        elif effective_addresses == total_addresses:
+            status = ACTIVE
+        else:
+            status = PARTIAL
+        status_counts[status] += 1
+
+        result_routes.append(
+            {
+                "index": index,
+                "cidr": route["cidr"],
+                "next_hop": route["next_hop"],
+                "metric": route["metric"],
+                "status": status,
+                "status_label": AUDIT_STATUS_LABELS[status],
+                "total_addresses": total_addresses,
+                "effective_addresses": effective_addresses,
+                "effective_cidrs": compress_intervals(remaining),
+                "ecmp_group": ecmp_group_of[index],
+            }
+        )
+
+    # 各网段的生效集合两两不相交（不同网段的生效集合必不相交：
+    # 相交网段必为包含关系，短前缀网段的生效集合已扣除长前缀网段），
+    # 因此全表覆盖地址数 = 各网段生效碎片长度之和（ECMP 共享只计一次）
+    covered_addresses = 0
+    for key, remaining in group_remaining.items():
+        covered_addresses += sum(e - s + 1 for s, e in remaining)
+
+    return {
+        "route_count": len(parsed_routes),
+        "routes": result_routes,
+        "summary": {
+            "active": status_counts[ACTIVE],
+            "partial": status_counts[PARTIAL],
+            "shadowed": status_counts[SHADOWED],
+            "covered_addresses": covered_addresses,
+            "uncovered_addresses": V4_SPACE - covered_addresses,
+        },
     }

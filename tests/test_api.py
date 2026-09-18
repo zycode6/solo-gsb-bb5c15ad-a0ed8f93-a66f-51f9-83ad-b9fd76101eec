@@ -1258,3 +1258,240 @@ def test_failover_existing_endpoints_unchanged():
     assert resp.status_code == 200
     assert resp.json()["results"][0]["next_hops"] == ["1.1.1.1"]
     assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200
+
+
+# ---------- /routes/audit ----------
+
+def post_audit(routes):
+    return client.post("/routes/audit", json={"routes": routes})
+
+
+def test_audit_lpm_metric_and_ecmp_sharing():
+    resp = post_audit(
+        [
+            {"cidr": "0.0.0.0/0", "next_hop": "192.0.2.254", "metric": 100},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 20},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 20},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.3", "metric": 30},
+            {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1", "metric": 60},
+            {"cidr": "10.2.0.0/16", "next_hop": "10.2.0.1", "metric": 40},
+            {"cidr": "10.2.0.0/16", "next_hop": "10.2.0.2", "metric": 40},
+        ]
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 7
+
+    routes = body["routes"]
+    # 严格保持 routes 输入顺序
+    assert [r["index"] for r in routes] == list(range(7))
+    assert [r["status"] for r in routes] == [
+        "partial",
+        "partial",
+        "partial",
+        "shadowed",
+        "active",
+        "active",
+        "active",
+    ]
+    assert routes[0]["status_label"] == "部分生效"
+    assert routes[4]["status_label"] == "生效"
+    assert routes[3]["status_label"] == "完全遮蔽"
+
+    # 默认路由：整个空间扣除 10.0.0.0/8
+    assert routes[0]["total_addresses"] == 1 << 32
+    assert routes[0]["effective_addresses"] == (1 << 32) - (1 << 24)
+    assert routes[0]["effective_cidrs"] == [
+        "0.0.0.0/5",
+        "8.0.0.0/7",
+        "11.0.0.0/8",
+        "12.0.0.0/6",
+        "16.0.0.0/4",
+        "32.0.0.0/3",
+        "64.0.0.0/2",
+        "128.0.0.0/1",
+    ]
+    assert routes[0]["ecmp_group"] == [0]
+
+    # /8 的两个 ECMP 路由共享同一集合（扣除两个 /16），保持输入顺序
+    expected_8 = [
+        "10.0.0.0/16",
+        "10.3.0.0/16",
+        "10.4.0.0/14",
+        "10.8.0.0/13",
+        "10.16.0.0/12",
+        "10.32.0.0/11",
+        "10.64.0.0/10",
+        "10.128.0.0/9",
+    ]
+    for i in (1, 2):
+        assert routes[i]["effective_addresses"] == (1 << 24) - 2 * (1 << 16)
+        assert routes[i]["effective_cidrs"] == expected_8
+        assert routes[i]["ecmp_group"] == [1, 2]
+
+    # 同前缀更高 metric：整体被遮蔽
+    assert routes[3]["effective_addresses"] == 0
+    assert routes[3]["effective_cidrs"] == []
+    assert routes[3]["ecmp_group"] == [3]
+
+    # 两条 /16 各自全生效；10.2.0.0/16 为 ECMP 对
+    assert routes[4]["effective_cidrs"] == ["10.1.0.0/16"]
+    assert routes[4]["ecmp_group"] == [4]
+    for i in (5, 6):
+        assert routes[i]["effective_cidrs"] == ["10.2.0.0/16"]
+        assert routes[i]["ecmp_group"] == [5, 6]
+
+    # 默认路由兜底：整个 IPv4 空间被完全覆盖（ECMP 共享集合只计一次）
+    assert body["summary"] == {
+        "active": 3,
+        "partial": 3,
+        "shadowed": 1,
+        "covered_addresses": 1 << 32,
+        "uncovered_addresses": 0,
+    }
+
+
+def test_audit_empty_routes():
+    resp = post_audit([])
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "route_count": 0,
+        "routes": [],
+        "summary": {
+            "active": 0,
+            "partial": 0,
+            "shadowed": 0,
+            "covered_addresses": 0,
+            "uncovered_addresses": 1 << 32,
+        },
+    }
+
+
+def test_audit_single_default_route_active():
+    resp = post_audit([{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}])
+    assert resp.status_code == 200
+    item = resp.json()["routes"][0]
+    assert item["status"] == "active"
+    assert item["effective_addresses"] == 1 << 32
+    assert item["effective_cidrs"] == ["0.0.0.0/0"]
+    assert item["ecmp_group"] == [0]
+
+
+def test_audit_bare_ip_route_normalized():
+    resp = post_audit([{"cidr": "8.8.8.8", "next_hop": "1.1.1.1", "metric": 5}])
+    assert resp.status_code == 200
+    item = resp.json()["routes"][0]
+    assert item["cidr"] == "8.8.8.8/32"
+    assert item["total_addresses"] == 1
+    assert item["status"] == "active"
+
+
+def test_audit_validation_422():
+    valid_route = {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 10}
+
+    # 缺少 routes / 请求体为空
+    assert client.post("/routes/audit", json={}).status_code == 422
+
+    # 超过 1000 条路由
+    too_many_routes = [
+        {"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}
+        for _ in range(1001)
+    ]
+    assert post_audit(too_many_routes).status_code == 422
+
+    # 非法 route cidr（主机位非零 / 前缀越界 / IPv6）
+    for bad in ["10.0.0.1/8", "10.0.0.0/33", "2001:db8::/32", "garbage"]:
+        route = {"cidr": bad, "next_hop": "10.0.0.1", "metric": 10}
+        assert post_audit([route]).status_code == 422, bad
+
+    # 非法 next_hop（CIDR 写法 / IPv6 / 越界 / 空串）
+    for bad in ["10.0.0.1/32", "::1", "999.0.0.1", ""]:
+        route = {"cidr": "10.0.0.0/8", "next_hop": bad, "metric": 10}
+        assert post_audit([route]).status_code == 422, bad
+
+    # 非法 metric：越界 / bool / float / 字符串
+    for bad_metric in [-1, 65536, True, 1.5, "10"]:
+        route = {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": bad_metric}
+        assert post_audit([route]).status_code == 422, bad_metric
+
+    # routes 类型错误
+    assert client.post("/routes/audit", json={"routes": "x"}).status_code == 422
+    assert client.post("/routes/audit", json={"routes": [valid_route, "x"]}).status_code == 422
+
+
+def test_audit_limits_accepted():
+    routes = [
+        {"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}
+        for _ in range(1000)
+    ]
+    resp = post_audit(routes)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 1000
+    # 1000 条完全相同的默认路由：同一 ECMP 组，共享整个空间
+    assert body["summary"]["active"] == 1000
+    assert body["summary"]["covered_addresses"] == 1 << 32
+    assert body["routes"][0]["ecmp_group"] == list(range(1000))
+    assert body["routes"][-1]["effective_cidrs"] == ["0.0.0.0/0"]
+
+
+def test_audit_openapi_examples_present():
+    schema = client.get("/openapi.json").json()
+    op = schema["paths"]["/routes/audit"]["post"]
+    assert "审计" in op["summary"]
+    # 请求示例
+    examples = op["requestBody"]["content"]["application/json"]["examples"]
+    assert "routes" in list(examples.values())[0]["value"]
+    # 200 响应示例与实现真实输出一致
+    ok_example = op["responses"]["200"]["content"]["application/json"]["examples"][
+        "audit"
+    ]
+    assert ok_example["value"]["summary"]["covered_addresses"] == 1 << 32
+    # 响应模型字段
+    item_props = schema["components"]["schemas"]["RouteAuditItem"]["properties"]
+    for field in (
+        "index",
+        "cidr",
+        "next_hop",
+        "metric",
+        "status",
+        "status_label",
+        "total_addresses",
+        "effective_addresses",
+        "effective_cidrs",
+        "ecmp_group",
+    ):
+        assert field in item_props
+
+
+def test_audit_openapi_example_matches_real_response():
+    # OpenAPI 200 示例必须与真实计算结果一致
+    schema = client.get("/openapi.json").json()
+    op = schema["paths"]["/routes/audit"]["post"]
+    request_value = op["requestBody"]["content"]["application/json"]["examples"][
+        "audit"
+    ]["value"]
+    expected = op["responses"]["200"]["content"]["application/json"]["examples"][
+        "audit"
+    ]["value"]
+    resp = client.post("/routes/audit", json=request_value)
+    assert resp.status_code == 200
+    assert resp.json() == expected
+
+
+def test_audit_existing_endpoints_unchanged():
+    # 新接口不影响既有接口
+    assert client.get("/health").status_code == 200
+    assert client.get("/").status_code == 200
+    resp = post_resolve(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8"],
+    )
+    assert resp.status_code == 200
+    resp = post_failover(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8"],
+        [],
+    )
+    assert resp.status_code == 200
+    assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200

@@ -2,9 +2,9 @@
 import random
 
 import pytest
-from ipaddress import ip_network
+from ipaddress import IPv4Network, collapse_addresses, ip_network
 
-from app.analyzer import parse_cidr_v4
+from app.analyzer import V4_SPACE, merge_intervals, parse_cidr_v4
 from app.router import (
     FAILED_NEXT_HOPS_MAX,
     METRIC_MAX,
@@ -14,6 +14,7 @@ from app.router import (
     DuplicateTargetsError,
     InvalidIPv4AddressError,
     InvalidMetricError,
+    audit_routes,
     failover_routes,
     normalize_metric,
     parse_address_v4,
@@ -770,3 +771,408 @@ def test_failover_random_oracle():
             expected_counts[expected_impact] += 1
 
         assert result["summary"] == expected_counts
+
+
+# ---------- 全表审计（audit） ----------
+
+def test_audit_lpm_metric_and_ecmp_sharing():
+    # 综合场景：默认路由被 /8 挖掉一块；/8 内被两个 /16 挖掉；
+    # /8 的 metric 30 路由被同前缀更低 metric 遮蔽；两条 /16 ECMP 共享
+    result = audit_routes(
+        [
+            ("0.0.0.0/0", "192.0.2.254", 100),
+            ("10.0.0.0/8", "10.0.0.1", 20),
+            ("10.0.0.0/8", "10.0.0.2", 20),
+            ("10.0.0.0/8", "10.0.0.3", 30),
+            ("10.1.0.0/16", "10.1.0.1", 60),
+            ("10.2.0.0/16", "10.2.0.1", 40),
+            ("10.2.0.0/16", "10.2.0.2", 40),
+        ]
+    )
+    assert result["route_count"] == 7
+    routes = result["routes"]
+    assert [r["index"] for r in routes] == list(range(7))  # 保持输入顺序
+    assert [r["status"] for r in routes] == [
+        "partial",
+        "partial",
+        "partial",
+        "shadowed",
+        "active",
+        "active",
+        "active",
+    ]
+    assert routes[0]["status_label"] == "部分生效"
+    assert routes[4]["status_label"] == "生效"
+    assert routes[3]["status_label"] == "完全遮蔽"
+
+    # 默认路由：整个空间扣除 10.0.0.0/8（/16 在 /8 内，不重复扣除）
+    assert routes[0]["total_addresses"] == V4_SPACE
+    assert routes[0]["effective_addresses"] == V4_SPACE - (1 << 24)
+    assert routes[0]["effective_cidrs"] == [
+        "0.0.0.0/5",
+        "8.0.0.0/7",
+        "11.0.0.0/8",
+        "12.0.0.0/6",
+        "16.0.0.0/4",
+        "32.0.0.0/3",
+        "64.0.0.0/2",
+        "128.0.0.0/1",
+    ]
+    assert routes[0]["ecmp_group"] == [0]
+
+    # /8 的两个 ECMP 路由共享同一集合：扣除两个 /16
+    expected_8 = [
+        "10.0.0.0/16",
+        "10.3.0.0/16",
+        "10.4.0.0/14",
+        "10.8.0.0/13",
+        "10.16.0.0/12",
+        "10.32.0.0/11",
+        "10.64.0.0/10",
+        "10.128.0.0/9",
+    ]
+    for i in (1, 2):
+        assert routes[i]["effective_addresses"] == (1 << 24) - 2 * (1 << 16)
+        assert routes[i]["effective_cidrs"] == expected_8
+        assert routes[i]["ecmp_group"] == [1, 2]
+
+    # 同前缀更高 metric：整体被遮蔽
+    assert routes[3]["effective_addresses"] == 0
+    assert routes[3]["effective_cidrs"] == []
+    assert routes[3]["ecmp_group"] == [3]
+
+    # 两条 /16：各自全生效，10.2.0.0/16 为 ECMP 对
+    assert routes[4]["effective_cidrs"] == ["10.1.0.0/16"]
+    assert routes[4]["ecmp_group"] == [4]
+    for i in (5, 6):
+        assert routes[i]["effective_cidrs"] == ["10.2.0.0/16"]
+        assert routes[i]["ecmp_group"] == [5, 6]
+
+    # 汇总：默认路由兜底，整个 IPv4 空间被完全覆盖
+    assert result["summary"] == {
+        "active": 3,
+        "partial": 3,
+        "shadowed": 1,
+        "covered_addresses": V4_SPACE,
+        "uncovered_addresses": 0,
+    }
+
+
+def test_audit_longer_prefix_wins_regardless_of_metric():
+    # 短前缀 metric 0，长前缀 metric 100：LPM 仍然优先
+    result = audit_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 0),
+            ("10.1.0.0/16", "10.1.0.1", 100),
+        ]
+    )
+    first, second = result["routes"]
+    assert first["status"] == "partial"
+    assert first["effective_addresses"] == (1 << 24) - (1 << 16)
+    assert second["status"] == "active"
+    assert second["effective_cidrs"] == ["10.1.0.0/16"]
+
+
+def test_audit_fully_covered_by_longer_prefixes_is_shadowed():
+    # 两个 /9 恰好拼满 /8：/8 路由完全遮蔽（即使 metric 更低）
+    result = audit_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 0),
+            ("10.0.0.0/9", "10.0.0.2", 20),
+            ("10.128.0.0/9", "10.0.0.3", 20),
+        ]
+    )
+    assert [r["status"] for r in result["routes"]] == [
+        "shadowed",
+        "active",
+        "active",
+    ]
+    assert result["routes"][0]["effective_cidrs"] == []
+    assert result["summary"]["covered_addresses"] == 1 << 24
+
+
+def test_audit_same_network_lowest_metric_wins():
+    # 同网段三个 metric：仅最低 metric 的 ECMP 组生效，其余 shadowed
+    result = audit_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 20),
+            ("10.0.0.0/8", "10.0.0.2", 10),
+            ("10.0.0.0/8", "10.0.0.3", 10),
+            ("10.0.0.0/8", "10.0.0.4", 30),
+        ]
+    )
+    assert [r["status"] for r in result["routes"]] == [
+        "shadowed",
+        "active",
+        "active",
+        "shadowed",
+    ]
+    assert [r["ecmp_group"] for r in result["routes"]] == [[0], [1, 2], [1, 2], [3]]
+    assert result["routes"][1]["effective_cidrs"] == ["10.0.0.0/8"]
+    assert result["routes"][2]["effective_cidrs"] == ["10.0.0.0/8"]
+    # ECMP 共享集合在汇总中只计一次
+    assert result["summary"]["covered_addresses"] == 1 << 24
+
+
+def test_audit_duplicate_routes_share_set_and_order():
+    # 完全重复的路由（同 cidr/next_hop/metric）也是 ECMP 并行路由
+    result = audit_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 10),
+            ("10.0.0.0/8", "10.0.0.1", 10),
+        ]
+    )
+    assert [r["ecmp_group"] for r in result["routes"]] == [[0, 1], [0, 1]]
+    assert result["routes"][0]["effective_cidrs"] == ["10.0.0.0/8"]
+    assert result["routes"][1]["effective_cidrs"] == ["10.0.0.0/8"]
+    assert result["summary"]["active"] == 2
+    assert result["summary"]["covered_addresses"] == 1 << 24
+
+
+def test_audit_default_route_full_space_active():
+    result = audit_routes([("0.0.0.0/0", "1.1.1.1", 65535)])
+    item = result["routes"][0]
+    assert item["status"] == "active"
+    assert item["total_addresses"] == V4_SPACE
+    assert item["effective_addresses"] == V4_SPACE
+    assert item["effective_cidrs"] == ["0.0.0.0/0"]
+    assert result["summary"] == {
+        "active": 1,
+        "partial": 0,
+        "shadowed": 0,
+        "covered_addresses": V4_SPACE,
+        "uncovered_addresses": 0,
+    }
+
+
+def test_audit_empty_routes():
+    assert audit_routes([]) == {
+        "route_count": 0,
+        "routes": [],
+        "summary": {
+            "active": 0,
+            "partial": 0,
+            "shadowed": 0,
+            "covered_addresses": 0,
+            "uncovered_addresses": V4_SPACE,
+        },
+    }
+
+
+def test_audit_bare_ip_route_is_slash32():
+    result = audit_routes([("8.8.8.8", "1.1.1.1", 5)])
+    item = result["routes"][0]
+    assert item["cidr"] == "8.8.8.8/32"
+    assert item["total_addresses"] == 1
+    assert item["status"] == "active"
+    assert item["effective_cidrs"] == ["8.8.8.8/32"]
+
+
+def test_audit_disjoint_routes_all_active():
+    result = audit_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 10),
+            ("192.168.0.0/16", "192.168.0.1", 20),
+            ("8.8.8.8/32", "1.1.1.1", 0),
+        ]
+    )
+    assert [r["status"] for r in result["routes"]] == ["active"] * 3
+    assert result["summary"]["covered_addresses"] == (1 << 24) + (1 << 16) + 1
+    assert result["summary"]["uncovered_addresses"] == (
+        V4_SPACE - (1 << 24) - (1 << 16) - 1
+    )
+
+
+def test_audit_nested_three_levels():
+    # /8 扣 /16，/16 扣 /24，/24 全生效
+    result = audit_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 10),
+            ("10.1.0.0/16", "10.1.0.1", 10),
+            ("10.1.2.0/24", "10.1.2.1", 10),
+        ]
+    )
+    r8, r16, r24 = result["routes"]
+    assert r8["effective_addresses"] == (1 << 24) - (1 << 16)
+    assert r16["effective_addresses"] == (1 << 16) - (1 << 8)
+    assert r24["effective_addresses"] == 1 << 8
+    assert [r["status"] for r in result["routes"]] == [
+        "partial",
+        "partial",
+        "active",
+    ]
+    assert result["summary"]["covered_addresses"] == 1 << 24
+
+
+def test_audit_invalid_inputs_raise():
+    with pytest.raises(InvalidMetricError):
+        audit_routes([("10.0.0.0/8", "1.1.1.1", 65536)])
+    with pytest.raises(InvalidMetricError):
+        audit_routes([("10.0.0.0/8", "1.1.1.1", True)])
+    with pytest.raises(InvalidIPv4AddressError):
+        audit_routes([("10.0.0.0/8", "1.1.1.1/32", 0)])
+    with pytest.raises(InvalidIPv4AddressError):
+        audit_routes([("10.0.0.0/8", "::1", 0)])
+    with pytest.raises(Exception):
+        # CIDR 非法（主机位非零）
+        audit_routes([("10.0.0.1/8", "1.1.1.1", 0)])
+    with pytest.raises(Exception):
+        # IPv6 网段
+        audit_routes([("2001:db8::/32", "1.1.1.1", 0)])
+
+
+def test_audit_size_limits():
+    many_routes = [
+        ("10.0.0.0/8", f"10.0.{i // 256}.{(i % 256) + 1}", i % (METRIC_MAX + 1))
+        for i in range(ROUTES_MAX + 1)
+    ]
+    with pytest.raises(ValueError):
+        audit_routes(many_routes)
+
+
+def test_audit_max_routes_accepted():
+    routes = [("0.0.0.0/0", "1.1.1.1", 0) for _ in range(ROUTES_MAX)]
+    result = audit_routes(routes)
+    assert result["route_count"] == ROUTES_MAX
+    # 1000 条完全相同的默认路由：同一 ECMP 组，共享整个空间
+    assert result["summary"]["active"] == ROUTES_MAX
+    assert result["summary"]["covered_addresses"] == V4_SPACE
+    assert result["routes"][0]["ecmp_group"] == list(range(ROUTES_MAX))
+    assert result["routes"][-1]["effective_cidrs"] == ["0.0.0.0/0"]
+
+
+# ---------- 属性测试：audit 与逐地址暴力 oracle 对比 ----------
+
+def _oracle_audit_sets(routes, space_start, space_end):
+    """逐地址暴力解析：返回 {路由序号: 生效地址整数集合}（仅空间内部分）。
+
+    对每个地址独立执行 LPM + 同网段最低 metric 选择，把地址记到全部
+    ECMP 胜出路由名下（共享）。
+    """
+    parsed = []
+    for cidr, _hop, metric in routes:
+        start, end, text = parse_cidr_v4(cidr)
+        parsed.append((start, end, int(text.rsplit("/", 1)[1]), metric))
+    winners = {i: set() for i in range(len(routes))}
+    for value in range(space_start, space_end + 1):
+        best_prefix = -1
+        best_key = None
+        for start, end, prefixlen, _metric in parsed:
+            if start <= value <= end and prefixlen > best_prefix:
+                best_prefix = prefixlen
+                best_key = (start, end)
+        if best_key is None:
+            continue
+        min_metric = min(
+            metric for start, end, _p, metric in parsed if (start, end) == best_key
+        )
+        for index, (start, end, _p, metric) in enumerate(parsed):
+            if (start, end) == best_key and metric == min_metric:
+                winners[index].add(value)
+    return winners
+
+
+def _cidrs_to_intervals(cidrs):
+    """CIDR 列表转闭区间列表（不展开地址，可安全处理 0.0.0.0/0）。"""
+    return [
+        (int(net.network_address), int(net.broadcast_address))
+        for net in (IPv4Network(c) for c in cidrs)
+    ]
+
+
+def _clip_to_space(intervals, space_start, space_end):
+    """区间列表裁剪到审计空间并展开为地址集合（空间仅 1024 个地址）。"""
+    out = set()
+    for start, end in intervals:
+        lo, hi = max(start, space_start), min(end, space_end)
+        if lo <= hi:
+            out.update(range(lo, hi + 1))
+    return out
+
+
+def test_audit_random_oracle():
+    rng = random.Random(20260918)
+    # 在 10.0.0.0/22（1024 个地址）内做逐地址暴力验证
+    base = ip_network("10.0.0.0/22")
+    space_start = int(base.network_address)
+    space_end = int(base.broadcast_address)
+    candidate_nets = ["0.0.0.0/0", "10.0.0.0/8", "10.0.0.0/16"]
+    for prefixlen in (23, 24, 26, 28, 30, 32):
+        candidate_nets.extend(str(n) for n in base.subnets(new_prefix=prefixlen))
+    hops_pool = [f"192.0.2.{i}" for i in range(1, 9)]
+
+    for _ in range(100):
+        n_routes = rng.randint(0, 12)
+        raw_routes = [
+            (rng.choice(candidate_nets), rng.choice(hops_pool), rng.randint(0, 5))
+            for _ in range(n_routes)
+        ]
+        result = audit_routes(raw_routes)
+        oracle = _oracle_audit_sets(raw_routes, space_start, space_end)
+
+        assert [r["index"] for r in result["routes"]] == list(range(n_routes))
+        distinct_intervals = []  # 各 ECMP 组去重后的生效区间（用于并集/不相交检查）
+        seen_sets = set()
+        for index, item in enumerate(result["routes"]):
+            intervals = _cidrs_to_intervals(item["effective_cidrs"])
+
+            # 生效集合与逐地址 oracle 一致（比较裁剪到审计空间的部分）
+            got_in_space = _clip_to_space(intervals, space_start, space_end)
+            assert got_in_space == oracle[index], (index, raw_routes)
+
+            # 无损：effective_addresses 等于 CIDR 区间总长度（不展开地址）
+            assert item["effective_addresses"] == sum(
+                e - s + 1 for s, e in intervals
+            )
+            # 状态与生效数一致
+            if item["effective_addresses"] == 0:
+                assert item["status"] == "shadowed"
+                assert item["effective_cidrs"] == []
+            elif item["effective_addresses"] == item["total_addresses"]:
+                assert item["status"] == "active"
+            else:
+                assert item["status"] == "partial"
+
+            # 最少块：与标准库 collapse_addresses 结果一致
+            collapsed = [
+                str(n)
+                for n in collapse_addresses(IPv4Network(c) for c in item["effective_cidrs"])
+            ]
+            assert collapsed == item["effective_cidrs"]
+
+            # ecmp_group：同网段同 metric 的全部路由，按输入顺序，含自身
+            expected_group = [
+                j
+                for j, (c, _h, m) in enumerate(raw_routes)
+                if parse_cidr_v4(c)[2] == item["cidr"] and m == item["metric"]
+            ]
+            assert item["ecmp_group"] == expected_group
+            # 组内共享同一生效集合
+            for peer in expected_group:
+                assert (
+                    result["routes"][peer]["effective_cidrs"]
+                    == item["effective_cidrs"]
+                )
+
+            key = tuple(item["effective_cidrs"])
+            if key not in seen_sets:
+                seen_sets.add(key)
+                distinct_intervals.extend(intervals)
+
+        # 不同 ECMP 组的生效集合互不相交：合并后总长度不变
+        total = sum(e - s + 1 for s, e in distinct_intervals)
+        merged = merge_intervals(distinct_intervals)
+        merged_total = sum(e - s + 1 for s, e in merged)
+        assert merged_total == total
+
+        # 汇总一致性
+        statuses = [r["status"] for r in result["routes"]]
+        assert result["summary"]["active"] == statuses.count("active")
+        assert result["summary"]["partial"] == statuses.count("partial")
+        assert result["summary"]["shadowed"] == statuses.count("shadowed")
+        # 覆盖数 = 各 ECMP 组生效集合并集大小（共享集合只计一次）
+        assert result["summary"]["covered_addresses"] == merged_total
+        assert result["summary"]["uncovered_addresses"] == V4_SPACE - merged_total
+        # 与 oracle 的空间内并集一致
+        oracle_union = set().union(*oracle.values()) if oracle else set()
+        assert _clip_to_space(merged, space_start, space_end) == oracle_union

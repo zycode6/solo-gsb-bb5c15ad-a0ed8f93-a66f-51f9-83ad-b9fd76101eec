@@ -51,6 +51,14 @@ CIDR 变更（`cidr_changed`）与未变（`unchanged`），并在各自清单�
 逐目标返回 `before` / `after` / `impact`（`unchanged` / `ecmp_reduced` /
 `rerouted` / `unreachable`），并汇总四类影响的目标数。
 
+`POST /routes/audit` 做**全表路由审计**：按“最长前缀优先、同前缀最低
+metric、同 metric 并行路由（ECMP）共享”的语义，计算**每条路由**在整个
+IPv4 空间**实际负责**的地址集合，逐路由返回 `active` / `partial` /
+`shadowed` 状态、生效地址数与**无损压缩、数量最少**的 `effective_cidrs`；
+同网段、同 metric 的并行路由**共享**同一生效集合（各自完整报告、不拆分），
+`ecmp_group` 按输入顺序列出全部并行路由序号；`summary` 汇总三种状态的
+路由数与全表覆盖 / 未覆盖地址数（ECMP 共享集合只计一次）。
+
 > 遮蔽来源不区分动作：先前的 **allow 与 deny 规则取并集**，共同遮蔽后续规则。
 
 ---
@@ -71,6 +79,7 @@ docker compose up --build -d
 - **网段清单差异接口：** `POST http://localhost:8000/cidrs/diff`
 - **路由解析接口：** `POST http://localhost:8000/routes/resolve`
 - **故障切换接口：** `POST http://localhost:8000/routes/failover`
+- **路由审计接口：** `POST http://localhost:8000/routes/audit`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
 - **OpenAPI Schema：** http://localhost:8000/openapi.json
 - **健康检查：** http://localhost:8000/health
@@ -1181,6 +1190,218 @@ curl -s http://localhost:8000/routes/failover \
   }'
 ```
 
+---
+
+### `POST /routes/audit`
+
+审计整张静态路由表：按与 `/routes/resolve` 一致的选择语义，计算**每条
+路由**在整个 IPv4 空间（`0.0.0.0/0`）上**实际负责**的地址集合。
+
+1. **最长前缀优先**：地址被更长前缀的路由网段覆盖时，短前缀路由在这些
+   地址上永远不生效（与 metric 无关）；
+2. **同前缀最低 metric**：规范化网段相同的路由中，仅最低 metric 者生效，
+   更高 metric 的路由整体被遮蔽（生效集合为空）；
+3. **ECMP 共享**：同网段、同（最低）metric 的并行路由**共享**同一生效
+   集合，各自完整报告（不拆分），`ecmp_group` 按输入顺序列出同网段同
+   metric 的全部路由序号（含自身）。
+
+- `routes`：**0～1000 条**路由（允许为空 `[]`，此时整个 IPv4 空间均未
+  覆盖）。`cidr` / `next_hop` / `metric` 的校验与 `/routes/resolve`
+  完全一致（严格 IPv4 CIDR、纯地址下一跳、metric 为 0～65535 的整数）。
+- `routes` 响应**严格保持输入顺序**；全程只做 32 位整数区间运算，
+  **不逐地址展开网段**。
+
+`status` 分类：
+
+| 值 | 含义 |
+| --- | --- |
+| `active` | 网段全部地址生效（未被更长前缀覆盖，且为同前缀最低 metric） |
+| `partial` | 部分地址生效（其余被更长前缀路由夺走） |
+| `shadowed` | 生效集合为空（被更长前缀完全覆盖，或同前缀存在更低 metric） |
+
+#### 请求体
+
+```json
+{
+  "routes": [
+    {"cidr": "0.0.0.0/0",   "next_hop": "192.0.2.254", "metric": 100},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.1",    "metric": 20},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.2",    "metric": 20},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.3",    "metric": 30},
+    {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1",    "metric": 60},
+    {"cidr": "10.2.0.0/16", "next_hop": "10.2.0.1",    "metric": 40},
+    {"cidr": "10.2.0.0/16", "next_hop": "10.2.0.2",    "metric": 40}
+  ]
+}
+```
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `route_count` | 请求中的路由条数 |
+| `routes[]` | 逐路由审计结果，**严格保持 routes 输入顺序** |
+| `routes[].index` | 路由在输入中的序号（从 0 开始） |
+| `routes[].cidr` / `.next_hop` / `.metric` | 规范化后的路由三元组 |
+| `routes[].status` | `active` / `partial` / `shadowed` |
+| `routes[].status_label` | 状态中文说明（生效 / 部分生效 / 完全遮蔽） |
+| `routes[].total_addresses` | 本路由网段覆盖的地址总数 |
+| `routes[].effective_addresses` | 本路由在整个 IPv4 空间实际负责的地址数 |
+| `routes[].effective_cidrs` | 生效地址集合**无损压缩后的最少 CIDR 列表**（空表示完全遮蔽） |
+| `routes[].ecmp_group` | 同网段、同 metric 的并行路由序号（含自身），按输入顺序；组内共享同一生效集合 |
+| `summary.active` / `.partial` / `.shadowed` | 三种状态各自的路由数（总和 = `route_count`） |
+| `summary.covered_addresses` | 全表在整个 IPv4 空间实际覆盖的地址数（ECMP 共享集合只计一次） |
+| `summary.uncovered_addresses` | 未被任何路由覆盖的地址数（= 2³² − `covered_addresses`） |
+
+#### 响应示例（200）
+
+上例中：默认路由 `0.0.0.0/0` 被 `10.0.0.0/8` 挖掉一块（`partial`）；
+`10.0.0.0/8` 的两个 metric 20 路由组成 ECMP、共享扣除两个 `/16` 后的
+集合（`partial`），metric 30 的同网段路由被完全遮蔽；两条 `/16` 各自
+全生效（`active`），其中 `10.2.0.0/16` 是一对 ECMP。默认路由兜底，
+整个 IPv4 空间被完全覆盖：
+
+```json
+{
+  "route_count": 7,
+  "routes": [
+    {
+      "index": 0,
+      "cidr": "0.0.0.0/0",
+      "next_hop": "192.0.2.254",
+      "metric": 100,
+      "status": "partial",
+      "status_label": "部分生效",
+      "total_addresses": 4294967296,
+      "effective_addresses": 4278190080,
+      "effective_cidrs": [
+        "0.0.0.0/5",
+        "8.0.0.0/7",
+        "11.0.0.0/8",
+        "12.0.0.0/6",
+        "16.0.0.0/4",
+        "32.0.0.0/3",
+        "64.0.0.0/2",
+        "128.0.0.0/1"
+      ],
+      "ecmp_group": [0]
+    },
+    {
+      "index": 1,
+      "cidr": "10.0.0.0/8",
+      "next_hop": "10.0.0.1",
+      "metric": 20,
+      "status": "partial",
+      "status_label": "部分生效",
+      "total_addresses": 16777216,
+      "effective_addresses": 16646144,
+      "effective_cidrs": [
+        "10.0.0.0/16",
+        "10.3.0.0/16",
+        "10.4.0.0/14",
+        "10.8.0.0/13",
+        "10.16.0.0/12",
+        "10.32.0.0/11",
+        "10.64.0.0/10",
+        "10.128.0.0/9"
+      ],
+      "ecmp_group": [1, 2]
+    },
+    {
+      "index": 2,
+      "cidr": "10.0.0.0/8",
+      "next_hop": "10.0.0.2",
+      "metric": 20,
+      "status": "partial",
+      "status_label": "部分生效",
+      "total_addresses": 16777216,
+      "effective_addresses": 16646144,
+      "effective_cidrs": [
+        "10.0.0.0/16",
+        "10.3.0.0/16",
+        "10.4.0.0/14",
+        "10.8.0.0/13",
+        "10.16.0.0/12",
+        "10.32.0.0/11",
+        "10.64.0.0/10",
+        "10.128.0.0/9"
+      ],
+      "ecmp_group": [1, 2]
+    },
+    {
+      "index": 3,
+      "cidr": "10.0.0.0/8",
+      "next_hop": "10.0.0.3",
+      "metric": 30,
+      "status": "shadowed",
+      "status_label": "完全遮蔽",
+      "total_addresses": 16777216,
+      "effective_addresses": 0,
+      "effective_cidrs": [],
+      "ecmp_group": [3]
+    },
+    {
+      "index": 4,
+      "cidr": "10.1.0.0/16",
+      "next_hop": "10.1.0.1",
+      "metric": 60,
+      "status": "active",
+      "status_label": "生效",
+      "total_addresses": 65536,
+      "effective_addresses": 65536,
+      "effective_cidrs": ["10.1.0.0/16"],
+      "ecmp_group": [4]
+    },
+    {
+      "index": 5,
+      "cidr": "10.2.0.0/16",
+      "next_hop": "10.2.0.1",
+      "metric": 40,
+      "status": "active",
+      "status_label": "生效",
+      "total_addresses": 65536,
+      "effective_addresses": 65536,
+      "effective_cidrs": ["10.2.0.0/16"],
+      "ecmp_group": [5, 6]
+    },
+    {
+      "index": 6,
+      "cidr": "10.2.0.0/16",
+      "next_hop": "10.2.0.2",
+      "metric": 40,
+      "status": "active",
+      "status_label": "生效",
+      "total_addresses": 65536,
+      "effective_addresses": 65536,
+      "effective_cidrs": ["10.2.0.0/16"],
+      "ecmp_group": [5, 6]
+    }
+  ],
+  "summary": {
+    "active": 3,
+    "partial": 3,
+    "shadowed": 1,
+    "covered_addresses": 4294967296,
+    "uncovered_addresses": 0
+  }
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/routes/audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "routes": [
+      {"cidr": "0.0.0.0/0", "next_hop": "192.0.2.254", "metric": 100},
+      {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 20},
+      {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 20},
+      {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1", "metric": 60}
+    ]
+  }'
+```
+
 ### 错误响应（422 Unprocessable Entity）
 
 以下输入均返回 HTTP `422`，错误明细位于 `detail`：
@@ -1205,6 +1426,9 @@ curl -s http://localhost:8000/routes/failover \
 - `/routes/failover` 除沿用 `/routes/resolve` 的全部校验外，还要求
   `failed_next_hops` 为 0～1000 个**唯一**的严格 IPv4 地址，重复时在
   `detail.duplicates` 中列出规范化下一跳及全部出现位置 `indexes`
+- `/routes/audit` 缺少 `routes`、路由数超过 1000，或路由的
+  `cidr` / `next_hop` / `metric` 不满足与 `/routes/resolve` 完全一致的
+  校验规则（`routes` 允许为空 `[]`）
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
 - IPv6 地址或网段：`2001:db8::/32`、`::1` 等
 - 非法 / 缺失 `action` 或 `default_action`、字段类型错误、JSON 格式错误
@@ -1241,9 +1465,14 @@ pytest -q
 数量/metric 边界，`/routes/failover` 的四类影响归类（unchanged /
 ecmp_reduced / rerouted / unreachable）、回退到更高 metric 与更短前缀、
 失败下一跳整体移除其全部路由、重复失败下一跳 422 与数量边界，
+`/routes/audit` 的最长前缀遮蔽（与 metric 无关）、同前缀最低 metric
+选择、ECMP 并行路由共享集合与输入顺序、active/partial/shadowed 分类、
+空路由表与 1000 条边界、全表覆盖 / 未覆盖地址汇总，
 以及用标准库 `ipaddress.collapse_addresses` 作为 oracle
 的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比；
-failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证）。
+failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证；
+audit 与逐地址暴力解析 oracle 在生效集合、ECMP 分组、互不相交性与
+汇总覆盖数上交叉验证）。
 
 ---
 
@@ -1254,8 +1483,8 @@ failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证�
 ├── app/
 │   ├── __init__.py
 │   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因、包含层级与网段清单差异
-│   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析与下一跳故障切换
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover 接口
+│   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析、下一跳故障切换与全表路由审计
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover、/routes/audit 接口
 ├── tests/
 │   ├── test_analyzer.py
 │   ├── test_router.py
@@ -1310,5 +1539,14 @@ failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证�
   比较归类 `impact`：两侧均不可达或结果一致为 `unchanged`，同网段同
   metric 但下一跳减少为 `ecmp_reduced`，仍可达但网段或 metric 改变为
   `rerouted`，原本可达而后不可达为 `unreachable`。
+- **全表审计**：`/routes/audit` 先把路由按规范化网段分组——地址 x 归某
+  网段负责，当且仅当该网段是覆盖 x 的**最长前缀**网段，且本路由的
+  metric 等于该网段的最低 metric。因此每个网段“留给本前缀”的集合 =
+  网段区间减去全部被它包含的更长前缀网段之并（与 metric 无关），组内
+  最低 metric 的路由（ECMP）**共享**该集合，更高 metric 的路由生效集合
+  为空。不同网段的生效集合必然互不相交（相交网段必为包含关系，短前缀
+  网段的生效集合已扣除长前缀网段），故全表覆盖地址数 = 各网段生效碎片
+  长度之和（ECMP 共享只计一次）。生效碎片复用“合并 + 贪心切块”得到
+  无损、数量最少的 `effective_cidrs`，全程区间运算，**不逐地址枚举**。
 - **整数运算**：全部基于 32 位无符号整数区间处理，避免字符串/对象开销，
   可正确支持 `0.0.0.0/0` 全空间等边界场景。

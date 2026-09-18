@@ -27,6 +27,7 @@ from .router import (
     DuplicateNextHopsError,
     DuplicateTargetsError,
     InvalidIPv4AddressError,
+    audit_routes,
     failover_routes,
     parse_address_v4,
     resolve_routes,
@@ -45,9 +46,11 @@ app = FastAPI(
         "变更与直接父节点变化（并标记规范化后网段相同但 id 不同的替换候选），"
         "通过 /routes/resolve 对目标地址做最长前缀匹配、最低 metric 的"
         "等价多路径（ECMP）路由解析，或通过 /routes/failover 模拟一组下一跳"
-        "失效后的路由切换影响（before/after/impact）。"
+        "失效后的路由切换影响（before/after/impact），或通过 /routes/audit "
+        "审计每条路由在整个 IPv4 空间实际负责的地址集合"
+        "（active/partial/shadowed + 无损最少 CIDR）。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -546,6 +549,73 @@ class RouteFailoverResponse(BaseModel):
     summary: RouteFailoverSummary
 
 
+# ---------- /routes/audit ----------
+
+
+class RouteAuditRequest(BaseModel):
+    """路由审计请求：0～1000 条静态路由。"""
+
+    routes: list[RouteEntry] = Field(
+        ...,
+        max_length=ROUTES_MAX,
+        description="静态路由列表，按数组顺序作为 ECMP 并列次序；允许为空",
+    )
+
+
+class RouteAuditItem(BaseModel):
+    index: int = Field(..., description="路由在输入中的序号（从 0 开始）")
+    cidr: str = Field(..., description="规范化后的路由 CIDR")
+    next_hop: str = Field(..., description="规范化后的下一跳 IPv4 地址")
+    metric: int = Field(..., description="路由度量")
+    status: Literal["active", "partial", "shadowed"] = Field(
+        ...,
+        description=(
+            "active 网段全部地址生效；partial 部分地址被更长前缀路由夺走；"
+            "shadowed 生效集合为空（被更长前缀完全覆盖，或同前缀存在更低 metric）"
+        ),
+    )
+    status_label: str = Field(..., description="状态中文说明")
+    total_addresses: int = Field(..., description="本路由网段覆盖的地址总数")
+    effective_addresses: int = Field(
+        ..., description="本路由在整个 IPv4 空间实际负责的地址数"
+    )
+    effective_cidrs: list[str] = Field(
+        ...,
+        description=(
+            "生效地址集合无损压缩后的最少 CIDR 列表（空表示完全遮蔽）；"
+            "同网段同最低 metric 的 ECMP 并行路由共享同一集合"
+        ),
+    )
+    ecmp_group: list[int] = Field(
+        ...,
+        description=(
+            "与本路由同网段、同 metric 的并行路由序号（含自身），按输入顺序；"
+            "组内路由共享同一生效地址集合"
+        ),
+    )
+
+
+class RouteAuditSummary(BaseModel):
+    active: int = Field(..., description="状态为 active 的路由数")
+    partial: int = Field(..., description="状态为 partial 的路由数")
+    shadowed: int = Field(..., description="状态为 shadowed 的路由数")
+    covered_addresses: int = Field(
+        ...,
+        description="全表在整个 IPv4 空间实际覆盖的地址数（ECMP 共享集合只计一次）",
+    )
+    uncovered_addresses: int = Field(
+        ..., description="整个 IPv4 空间中未被任何路由覆盖的地址数"
+    )
+
+
+class RouteAuditResponse(BaseModel):
+    route_count: int = Field(..., description="请求中的路由条数")
+    routes: list[RouteAuditItem] = Field(
+        ..., description="逐路由审计结果，严格保持 routes 输入顺序"
+    )
+    summary: RouteAuditSummary
+
+
 @app.get("/", tags=["meta"])
 def root() -> dict:
     """服务信息。"""
@@ -943,6 +1013,194 @@ def routes_failover(request: RouteFailoverRequest) -> dict:
             status_code=422,
             detail={"error": "duplicate_next_hops", "duplicates": exc.duplicates},
         ) from exc
+    except (InvalidCIDRError, InvalidIPv4AddressError):
+        # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
+        raise
+
+
+@app.post(
+    "/routes/audit",
+    response_model=RouteAuditResponse,
+    tags=["routes"],
+    summary="审计每条路由在整个 IPv4 空间实际负责的地址集合（LPM + 最低 metric + ECMP）",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "audit": {
+                            "summary": "LPM 遮蔽 + 最低 metric + ECMP 共享",
+                            "value": {
+                                "route_count": 7,
+                                "routes": [
+                                    {
+                                        "index": 0,
+                                        "cidr": "0.0.0.0/0",
+                                        "next_hop": "192.0.2.254",
+                                        "metric": 100,
+                                        "status": "partial",
+                                        "status_label": "部分生效",
+                                        "total_addresses": 4294967296,
+                                        "effective_addresses": 4278190080,
+                                        "effective_cidrs": [
+                                            "0.0.0.0/5",
+                                            "8.0.0.0/7",
+                                            "11.0.0.0/8",
+                                            "12.0.0.0/6",
+                                            "16.0.0.0/4",
+                                            "32.0.0.0/3",
+                                            "64.0.0.0/2",
+                                            "128.0.0.0/1",
+                                        ],
+                                        "ecmp_group": [0],
+                                    },
+                                    {
+                                        "index": 1,
+                                        "cidr": "10.0.0.0/8",
+                                        "next_hop": "10.0.0.1",
+                                        "metric": 20,
+                                        "status": "partial",
+                                        "status_label": "部分生效",
+                                        "total_addresses": 16777216,
+                                        "effective_addresses": 16646144,
+                                        "effective_cidrs": [
+                                            "10.0.0.0/16",
+                                            "10.3.0.0/16",
+                                            "10.4.0.0/14",
+                                            "10.8.0.0/13",
+                                            "10.16.0.0/12",
+                                            "10.32.0.0/11",
+                                            "10.64.0.0/10",
+                                            "10.128.0.0/9",
+                                        ],
+                                        "ecmp_group": [1, 2],
+                                    },
+                                    {
+                                        "index": 2,
+                                        "cidr": "10.0.0.0/8",
+                                        "next_hop": "10.0.0.2",
+                                        "metric": 20,
+                                        "status": "partial",
+                                        "status_label": "部分生效",
+                                        "total_addresses": 16777216,
+                                        "effective_addresses": 16646144,
+                                        "effective_cidrs": [
+                                            "10.0.0.0/16",
+                                            "10.3.0.0/16",
+                                            "10.4.0.0/14",
+                                            "10.8.0.0/13",
+                                            "10.16.0.0/12",
+                                            "10.32.0.0/11",
+                                            "10.64.0.0/10",
+                                            "10.128.0.0/9",
+                                        ],
+                                        "ecmp_group": [1, 2],
+                                    },
+                                    {
+                                        "index": 3,
+                                        "cidr": "10.0.0.0/8",
+                                        "next_hop": "10.0.0.3",
+                                        "metric": 30,
+                                        "status": "shadowed",
+                                        "status_label": "完全遮蔽",
+                                        "total_addresses": 16777216,
+                                        "effective_addresses": 0,
+                                        "effective_cidrs": [],
+                                        "ecmp_group": [3],
+                                    },
+                                    {
+                                        "index": 4,
+                                        "cidr": "10.1.0.0/16",
+                                        "next_hop": "10.1.0.1",
+                                        "metric": 60,
+                                        "status": "active",
+                                        "status_label": "生效",
+                                        "total_addresses": 65536,
+                                        "effective_addresses": 65536,
+                                        "effective_cidrs": ["10.1.0.0/16"],
+                                        "ecmp_group": [4],
+                                    },
+                                    {
+                                        "index": 5,
+                                        "cidr": "10.2.0.0/16",
+                                        "next_hop": "10.2.0.1",
+                                        "metric": 40,
+                                        "status": "active",
+                                        "status_label": "生效",
+                                        "total_addresses": 65536,
+                                        "effective_addresses": 65536,
+                                        "effective_cidrs": ["10.2.0.0/16"],
+                                        "ecmp_group": [5, 6],
+                                    },
+                                    {
+                                        "index": 6,
+                                        "cidr": "10.2.0.0/16",
+                                        "next_hop": "10.2.0.2",
+                                        "metric": 40,
+                                        "status": "active",
+                                        "status_label": "生效",
+                                        "total_addresses": 65536,
+                                        "effective_addresses": 65536,
+                                        "effective_cidrs": ["10.2.0.0/16"],
+                                        "ecmp_group": [5, 6],
+                                    },
+                                ],
+                                "summary": {
+                                    "active": 3,
+                                    "partial": 3,
+                                    "shadowed": 1,
+                                    "covered_addresses": 4294967296,
+                                    "uncovered_addresses": 0,
+                                },
+                            },
+                        }
+                    }
+                }
+            }
+        },
+    },
+)
+def routes_audit(
+    request: RouteAuditRequest = Body(
+        ...,
+        openapi_examples={
+            "audit": {
+                "summary": "LPM 遮蔽 + 最低 metric + ECMP 共享",
+                "value": {
+                    "routes": [
+                        {"cidr": "0.0.0.0/0", "next_hop": "192.0.2.254", "metric": 100},
+                        {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 20},
+                        {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 20},
+                        {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.3", "metric": 30},
+                        {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1", "metric": 60},
+                        {"cidr": "10.2.0.0/16", "next_hop": "10.2.0.1", "metric": 40},
+                        {"cidr": "10.2.0.0/16", "next_hop": "10.2.0.2", "metric": 40},
+                    ]
+                },
+            }
+        },
+    ),
+) -> dict:
+    """按“最长前缀优先、同前缀最低 metric、同 metric 并行路由（ECMP）共享”
+    的语义，计算每条路由在整个 IPv4 空间**实际负责**的地址集合。
+
+    - 逐路由返回 `status`（`active` / `partial` / `shadowed`）、
+      `effective_addresses` 与无损压缩、数量最少的 `effective_cidrs`；
+    - 更长前缀的路由（任意 metric）在交叠地址上优先于短前缀路由；
+      同网段路由中仅最低 metric 者生效，更高 metric 的整体 `shadowed`；
+    - 同网段、同 metric 的并行路由**共享**同一生效集合（各自完整报告，
+      不拆分），`ecmp_group` 按输入顺序列出全部并行路由序号（含自身）；
+    - `summary` 汇总三种状态的路由数与全表覆盖 / 未覆盖地址数
+      （ECMP 共享集合只计一次）；
+    - `routes` 允许为空 `[]`（此时整个 IPv4 空间均未覆盖），最多 1000 条；
+      CIDR / 下一跳 / metric 校验与 /routes/resolve 完全一致。
+
+    全程只做 32 位整数区间运算，**不逐地址展开网段**。
+    """
+    try:
+        return audit_routes(
+            [(route.cidr, route.next_hop, route.metric) for route in request.routes]
+        )
     except (InvalidCIDRError, InvalidIPv4AddressError):
         # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
         raise
