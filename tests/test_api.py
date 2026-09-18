@@ -1258,3 +1258,271 @@ def test_failover_existing_endpoints_unchanged():
     assert resp.status_code == 200
     assert resp.json()["results"][0]["next_hops"] == ["1.1.1.1"]
     assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200
+
+
+# ---------- /routes/audit ----------
+
+def post_audit(routes):
+    return client.post("/routes/audit", json={"routes": routes})
+
+
+AUDIT_ROUTES = [
+    {"cidr": "10.0.0.0/24", "next_hop": "10.0.0.1", "metric": 100},
+    {"cidr": "10.0.0.0/24", "next_hop": "10.0.0.2", "metric": 10},
+    {"cidr": "10.0.0.0/24", "next_hop": "10.0.0.3", "metric": 10},
+    {"cidr": "10.0.0.128/25", "next_hop": "10.0.0.254", "metric": 50},
+    {"cidr": "10.0.1.0/24", "next_hop": "10.0.1.1", "metric": 20},
+    {"cidr": "10.0.1.0/24", "next_hop": "10.0.1.2", "metric": 20},
+    {"cidr": "10.0.1.0/24", "next_hop": "10.0.1.9", "metric": 99},
+    {"cidr": "10.0.2.0/25", "next_hop": "10.0.2.1", "metric": 5},
+    {"cidr": "10.0.2.128/25", "next_hop": "10.0.2.2", "metric": 5},
+]
+
+
+def test_audit_statuses_ecmp_sharing_and_order():
+    resp = post_audit(AUDIT_ROUTES)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 9
+
+    results = body["results"]
+    # 严格保持输入顺序
+    assert [r["index"] for r in results] == list(range(9))
+    assert [r["status"] for r in results] == [
+        "shadowed",   # 同网段 metric 100 被最低 metric 10 淘汰
+        "partial",    # /24 被 /25 遮蔽下半段
+        "partial",    # ECMP 并行路由共享同一集合
+        "active",     # /25 子网段
+        "active",     # /24 全生效（ECMP 成员 1）
+        "active",     # ECMP 成员 2，与成员 1 集合完全相同
+        "shadowed",   # metric 99 被 metric 20 淘汰
+        "active",
+        "active",
+    ]
+
+    # 高 metric 遮蔽路由：生效集合为空，但 ecmp_next_hops 指向最低 metric 组
+    assert results[0] == {
+        "index": 0,
+        "cidr": "10.0.0.0/24",
+        "next_hop": "10.0.0.1",
+        "metric": 100,
+        "status": "shadowed",
+        "status_label": "完全遮蔽",
+        "total_addresses": 256,
+        "effective_addresses": 0,
+        "effective_cidrs": [],
+        "ecmp_next_hops": ["10.0.0.2", "10.0.0.3"],
+    }
+
+    # 同 metric 并行路由：共享集合 + 输入顺序
+    assert results[1] == {
+        "index": 1,
+        "cidr": "10.0.0.0/24",
+        "next_hop": "10.0.0.2",
+        "metric": 10,
+        "status": "partial",
+        "status_label": "部分生效",
+        "total_addresses": 256,
+        "effective_addresses": 128,
+        "effective_cidrs": ["10.0.0.0/25"],
+        "ecmp_next_hops": ["10.0.0.2", "10.0.0.3"],
+    }
+    assert results[2]["effective_addresses"] == 128
+    assert results[2]["effective_cidrs"] == ["10.0.0.0/25"]
+    assert results[2]["ecmp_next_hops"] == ["10.0.0.2", "10.0.0.3"]
+    # 共享：两个并行路由的生效字段完全一致
+    for key in (
+        "effective_addresses",
+        "effective_cidrs",
+        "ecmp_next_hops",
+    ):
+        assert results[1][key] == results[2][key]
+
+    # 子网段 active
+    assert results[3] == {
+        "index": 3,
+        "cidr": "10.0.0.128/25",
+        "next_hop": "10.0.0.254",
+        "metric": 50,
+        "status": "active",
+        "status_label": "全部生效",
+        "total_addresses": 128,
+        "effective_addresses": 128,
+        "effective_cidrs": ["10.0.0.128/25"],
+        "ecmp_next_hops": ["10.0.0.254"],
+    }
+
+    # 10.0.1.0/24 的 ECMP 成员共享整段，高 metric 成员遮蔽
+    assert results[4]["status"] == results[5]["status"] == "active"
+    assert results[4]["effective_cidrs"] == results[5]["effective_cidrs"] == [
+        "10.0.1.0/24"
+    ]
+    assert results[4]["ecmp_next_hops"] == results[5]["ecmp_next_hops"] == [
+        "10.0.1.1",
+        "10.0.1.2",
+    ]
+    assert results[6]["status"] == "shadowed"
+    assert results[6]["effective_cidrs"] == []
+    assert results[6]["ecmp_next_hops"] == ["10.0.1.1", "10.0.1.2"]
+
+    assert results[7]["effective_cidrs"] == ["10.0.2.0/25"]
+    assert results[8]["effective_cidrs"] == ["10.0.2.128/25"]
+
+
+def test_audit_summary_counts_and_space_invariants():
+    body = post_audit(AUDIT_ROUTES).json()
+    # 三个不相交网段：/24(256) + /24(256) + /25+/25(256) = 768
+    assert body["summary"] == {
+        "active": 5,
+        "partial": 2,
+        "shadowed": 2,
+        "routed_address_count": 768,
+        "unreachable_address_count": (1 << 32) - 768,
+        # partial 两条 ×128 + active：128 + 2×256 + 128 + 128 = 1152
+        "effective_address_sum": 1152,
+    }
+
+
+def test_audit_empty_routes_all_space_unreachable():
+    resp = post_audit([])
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "route_count": 0,
+        "results": [],
+        "summary": {
+            "active": 0,
+            "partial": 0,
+            "shadowed": 0,
+            "routed_address_count": 0,
+            "unreachable_address_count": 1 << 32,
+            "effective_address_sum": 0,
+        },
+    }
+
+
+def test_audit_default_route_covers_full_space():
+    resp = post_audit(
+        [
+            {"cidr": "0.0.0.0/0", "next_hop": "192.0.2.254", "metric": 100},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 10},
+        ]
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    default, ten = body["results"]
+    assert default["status"] == "partial"
+    assert default["effective_addresses"] == (1 << 32) - (1 << 24)
+    assert ten["status"] == "active"
+    summary = body["summary"]
+    assert summary["routed_address_count"] == 1 << 32
+    assert summary["unreachable_address_count"] == 0
+    assert summary["effective_address_sum"] == (1 << 32)
+
+
+def test_audit_bare_ip_normalized_to_slash32():
+    resp = post_audit([{"cidr": "8.8.8.8", "next_hop": "1.1.1.1", "metric": 5}])
+    assert resp.status_code == 200
+    item = resp.json()["results"][0]
+    assert item["cidr"] == "8.8.8.8/32"
+    assert item["status"] == "active"
+    assert item["total_addresses"] == item["effective_addresses"] == 1
+    assert item["effective_cidrs"] == ["8.8.8.8/32"]
+
+
+def test_audit_lpm_beats_worse_metric():
+    # /8 metric 1 vs /16 metric 65535：/16 仍 active，/8 partial
+    resp = post_audit(
+        [
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 1},
+            {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1", "metric": 65535},
+        ]
+    )
+    assert resp.status_code == 200
+    parent, child = resp.json()["results"]
+    assert parent["status"] == "partial"
+    assert parent["effective_addresses"] == (1 << 24) - (1 << 16)
+    assert child["status"] == "active"
+    assert child["effective_addresses"] == 1 << 16
+
+
+def test_audit_validation_422():
+    # 缺少 routes / 请求体为空
+    assert client.post("/routes/audit", json={}).status_code == 422
+
+    # 超过 1000 条路由
+    too_many = [
+        {"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}
+        for _ in range(1001)
+    ]
+    assert post_audit(too_many).status_code == 422
+
+    # 非法 route cidr（主机位 / 前缀越界 / IPv6）
+    for bad in ["10.0.0.1/8", "10.0.0.0/33", "2001:db8::/32", "garbage"]:
+        route = {"cidr": bad, "next_hop": "10.0.0.1", "metric": 10}
+        assert post_audit([route]).status_code == 422, bad
+
+    # 非法 next_hop（CIDR 写法 / IPv6 / 前导零 / 越界 / 空）
+    for bad in ["10.0.0.1/32", "::1", "010.0.0.1", "999.0.0.1", ""]:
+        route = {"cidr": "10.0.0.0/8", "next_hop": bad, "metric": 10}
+        assert post_audit([route]).status_code == 422, bad
+
+    # 非法 metric：越界 / bool / float / 字符串
+    for bad_metric in [-1, 65536, True, 1.5, "10"]:
+        route = {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": bad_metric}
+        assert post_audit([route]).status_code == 422, bad_metric
+
+    # routes 类型错误
+    assert client.post(
+        "/routes/audit", json={"routes": "x"}
+    ).status_code == 422
+    # 路由条目缺字段
+    assert post_audit([{"cidr": "10.0.0.0/8", "metric": 1}]).status_code == 422
+    assert post_audit([{"next_hop": "10.0.0.1", "metric": 1}]).status_code == 422
+
+
+def test_audit_limits_accepted():
+    routes = [
+        {"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}
+        for _ in range(1000)
+    ]
+    resp = post_audit(routes)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 1000
+    assert len(body["results"]) == 1000
+    assert body["summary"]["active"] == 1000
+    assert body["summary"]["routed_address_count"] == 1 << 32
+    assert body["summary"]["unreachable_address_count"] == 0
+    assert body["summary"]["effective_address_sum"] == 1000 * (1 << 32)
+
+
+def test_audit_openapi_documented():
+    spec = client.get("/openapi.json").json()
+    assert "/routes/audit" in spec["paths"]
+    operation = spec["paths"]["/routes/audit"]["post"]
+    assert operation["summary"]
+    # 请求 / 响应模型已注册
+    assert "RouteAuditRequest" in spec["components"]["schemas"]
+    assert "RouteAuditResponse" in spec["components"]["schemas"]
+    assert "RouteAuditResult" in spec["components"]["schemas"]
+    assert "RouteAuditSummary" in spec["components"]["schemas"]
+    # 标签归入 routes
+    assert operation["tags"] == ["routes"]
+    # 内置 OpenAPI 示例
+    assert "audit" in operation["requestBody"]["content"]["application/json"]["examples"]
+    assert (
+        "audit"
+        in operation["responses"]["200"]["content"]["application/json"]["examples"]
+    )
+
+
+def test_audit_existing_endpoints_unchanged():
+    # 新接口不影响既有接口
+    assert client.get("/health").status_code == 200
+    assert client.get("/").status_code == 200
+    resp = post_resolve(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8"],
+    )
+    assert resp.status_code == 200
+    assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200
